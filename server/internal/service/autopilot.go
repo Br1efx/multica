@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -721,12 +722,10 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	}
 	projectID := currentAutopilot.ProjectID
 
-	if duplicate, found, err := issueguard.LockAndFindRecentAutopilotDuplicate(
-		ctx, qtx, ap.WorkspaceID, ap.ID, projectID, title, autopilotRecentDuplicateWindow,
-	); err != nil {
+	if duplicateID, found, err := s.findRecentAutopilotDuplicate(ctx, qtx, ap, *run, projectID, title); err != nil {
 		return fmt.Errorf("recent duplicate guard: %w", err)
 	} else if found {
-		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
+		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicateID), code: dispatch.ReasonAlreadyActive}
 	}
 
 	issueNumber, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, issueCountPolicy)
@@ -2068,6 +2067,200 @@ func prettifyJSON(raw []byte) ([]byte, error) {
 // so users can format templates either way; the canonical token is still
 // {{date}}.
 var issueTitleTemplateTokenRE = regexp.MustCompile(`\{\{\s*([^{}]*?)\s*\}\}`)
+
+// findRecentAutopilotDuplicate reports an issue this dispatch should collapse
+// onto instead of creating another.
+//
+// A webhook whose payload names a subject is matched against recent webhook
+// runs of this autopilot by that subject. The rendered title is not consulted
+// on that path: with no issue_title_template every event renders the same
+// title, and matching on it is what made one merge request swallow the next.
+// The advisory lock names the subject, so two deliveries of one subject cannot
+// both create, and two different subjects do not block each other.
+//
+// Anything that is not a webhook, and a webhook whose payload names no
+// subject, keeps the title guard.
+func (s *AutopilotService) findRecentAutopilotDuplicate(
+	ctx context.Context,
+	q *db.Queries,
+	ap db.Autopilot,
+	run db.AutopilotRun,
+	projectID pgtype.UUID,
+	title string,
+) (pgtype.UUID, bool, error) {
+	if run.Source == "webhook" {
+		if key := webhookDedupKey(run.TriggerPayload); key != "" {
+			return findRecentWebhookSubjectDuplicate(ctx, q, ap.ID, run.ID, key)
+		}
+	}
+	duplicate, found, err := issueguard.LockAndFindRecentAutopilotDuplicate(
+		ctx, q, ap.WorkspaceID, ap.ID, projectID, title, autopilotRecentDuplicateWindow,
+	)
+	if err != nil || !found {
+		return pgtype.UUID{}, false, err
+	}
+	return duplicate.ID, true, nil
+}
+
+// findRecentWebhookSubjectDuplicate locks the subject, then looks for a webhook
+// run of this autopilot from the last minute whose payload names the same
+// subject and that already created an issue.
+func findRecentWebhookSubjectDuplicate(
+	ctx context.Context,
+	q *db.Queries,
+	autopilotID, currentRunID pgtype.UUID,
+	key string,
+) (pgtype.UUID, bool, error) {
+	if err := q.LockIssueDuplicateKey(ctx, webhookSubjectLockKey(autopilotID, key)); err != nil {
+		return pgtype.UUID{}, false, err
+	}
+	recent, err := q.ListRecentAutopilotRunsForDedup(ctx, db.ListRecentAutopilotRunsForDedupParams{
+		AutopilotID:  autopilotID,
+		CreatedAfter: pgtype.Timestamptz{Time: time.Now().UTC().Add(-autopilotRecentDuplicateWindow), Valid: true},
+	})
+	if err != nil {
+		return pgtype.UUID{}, false, err
+	}
+	for _, row := range recent {
+		if row.ID == currentRunID || !row.IssueID.Valid {
+			continue
+		}
+		if webhookDedupKey(row.TriggerPayload) == key {
+			return row.IssueID, true, nil
+		}
+	}
+	return pgtype.UUID{}, false, nil
+}
+
+// webhookSubjectLockKey is the advisory-lock name for one webhook subject.
+// It is plain text. PostgreSQL rejects a NUL byte in a text parameter, and
+// the subject never needs one.
+func webhookSubjectLockKey(autopilotID pgtype.UUID, key string) string {
+	return "autopilot-webhook-dedup|" + util.UUIDToString(autopilotID) + "|" + key
+}
+
+// webhookDedupKey derives the subject identity of one webhook event from the
+// envelope stored on the run (handler.WebhookEnvelope: event + eventPayload).
+//
+// GitLab is the provider that motivated the guard: one merge-request action
+// fires open, update and merge_status within seconds, and those must collapse
+// onto a single issue, while a different merge request arriving in the same
+// window must not. So the key is object_kind plus the object's iid — never the
+// action, and never X-GitLab-Event-UUID, which is unique per HTTP delivery and
+// would split the burst apart. The same shape covers a GitLab push
+// (object_kind + checkout_sha) and a GitHub delivery (X-GitHub-Event plus the
+// subject number the payload carries).
+//
+// A payload that names no subject returns "", and the caller then falls back to the
+// title guard. Guessing an identity and getting it wrong would either drop a
+// real event or stop coalescing retries, so an unrecognised payload is left on
+// the old behaviour rather than hashed wholesale.
+func webhookDedupKey(triggerPayload []byte) string {
+	body := webhookEventBody(triggerPayload)
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+
+	if kind, _ := payload["object_kind"].(string); kind != "" {
+		if id := gitlabWebhookSubjectID(kind, payload); id != "" {
+			return "gitlab:" + kind + ":" + id
+		}
+		return ""
+	}
+
+	if number, ok := jsonNumberString(payload["number"]); ok {
+		return "github:" + number
+	}
+	if pr, ok := payload["pull_request"].(map[string]any); ok {
+		if number, ok := jsonNumberString(pr["number"]); ok {
+			return "github:pull_request:" + number
+		}
+	}
+	if issue, ok := payload["issue"].(map[string]any); ok {
+		if number, ok := jsonNumberString(issue["number"]); ok {
+			return "github:issue:" + number
+		}
+	}
+	return ""
+}
+
+// gitlabWebhookSubjectID is the stable id of the GitLab object an event is
+// about. `action` is deliberately not part of it: GitLab emits several actions
+// for one change, and the guard exists to merge that burst.
+func gitlabWebhookSubjectID(kind string, payload map[string]any) string {
+	switch kind {
+	case "push":
+		if sha, _ := payload["checkout_sha"].(string); sha != "" {
+			return sha
+		}
+		if sha, _ := payload["after"].(string); sha != "" {
+			return sha
+		}
+		return ""
+	default:
+		attrs, _ := payload["object_attributes"].(map[string]any)
+		if id, ok := jsonNumberString(attrs["iid"]); ok {
+			return id
+		}
+		// A note is about the thing it hangs off. GitLab stamps that thing's iid
+		// on the note itself (noteable_iid) and again under merge_request / issue /
+		// commit, so a thread of comments on one merge request collapses together.
+		if id, ok := jsonNumberString(payload["noteable_iid"]); ok {
+			return id
+		}
+		for _, key := range []string{"merge_request", "issue", "commit"} {
+			if obj, ok := payload[key].(map[string]any); ok {
+				if id, ok := jsonNumberString(obj["iid"]); ok {
+					return id
+				}
+			}
+		}
+		return ""
+	}
+}
+
+// jsonNumberString renders a JSON number as its canonical digit string.
+// Encoding/json decodes numbers into float64 by default, which would turn iid
+// 704 into "704.000000" and, past 2^53, stop being exact — so the field is
+// re-read through a Number.
+func jsonNumberString(v any) (string, bool) {
+	switch n := v.(type) {
+	case float64:
+		if n <= 0 || n != float64(int64(n)) {
+			return "", false
+		}
+		return strconv.FormatInt(int64(n), 10), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil || i <= 0 {
+			return "", false
+		}
+		return strconv.FormatInt(i, 10), true
+	default:
+		return "", false
+	}
+}
+
+// webhookEventBody returns the provider payload inside a webhook envelope, or
+// the raw body when the run stored the provider payload directly. The envelope
+// shape is handler.WebhookEnvelope; this package cannot import the handler, so
+// it recognises the shape by its two fields.
+func webhookEventBody(triggerPayload []byte) []byte {
+	if len(triggerPayload) == 0 {
+		return nil
+	}
+	var env struct {
+		EventPayload json.RawMessage `json:"eventPayload"`
+	}
+	if err := json.Unmarshal(triggerPayload, &env); err == nil && len(env.EventPayload) > 0 {
+		return env.EventPayload
+	}
+	return triggerPayload
+}
 
 // interpolateTemplate substitutes supported {{name}} placeholders in the
 // issue title template. Whitespace inside the braces ({{ date }}) is

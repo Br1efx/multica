@@ -1562,6 +1562,55 @@ func (q *Queries) ListAutopilots(ctx context.Context, arg ListAutopilotsParams) 
 	return items, nil
 }
 
+const listRecentAutopilotRunsForDedup = `-- name: ListRecentAutopilotRunsForDedup :many
+SELECT id, trigger_payload, issue_id
+FROM autopilot_run
+WHERE autopilot_id = $1
+  AND source = 'webhook'
+  AND status IN ('issue_created', 'running', 'completed')
+  AND issue_id IS NOT NULL
+  AND created_at >= $2::timestamptz
+ORDER BY created_at ASC
+`
+
+type ListRecentAutopilotRunsForDedupParams struct {
+	AutopilotID  pgtype.UUID        `json:"autopilot_id"`
+	CreatedAfter pgtype.Timestamptz `json:"created_after"`
+}
+
+type ListRecentAutopilotRunsForDedupRow struct {
+	ID             pgtype.UUID `json:"id"`
+	TriggerPayload []byte      `json:"trigger_payload"`
+	IssueID        pgtype.UUID `json:"issue_id"`
+}
+
+// Webhook runs of this autopilot that already created an issue inside the
+// recent-duplicate window. The caller derives a subject from each
+// trigger_payload (a GitLab object iid, a GitHub number) and collapses a later
+// delivery of the same subject onto the earlier issue. The subject is not a
+// column, so two events that share only a rendered title do not match here.
+// A run with no issue is excluded: the in-flight run this dispatch just opened
+// has not been linked yet, and must not count as its own duplicate.
+func (q *Queries) ListRecentAutopilotRunsForDedup(ctx context.Context, arg ListRecentAutopilotRunsForDedupParams) ([]ListRecentAutopilotRunsForDedupRow, error) {
+	rows, err := q.db.Query(ctx, listRecentAutopilotRunsForDedup, arg.AutopilotID, arg.CreatedAfter)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRecentAutopilotRunsForDedupRow{}
+	for rows.Next() {
+		var i ListRecentAutopilotRunsForDedupRow
+		if err := rows.Scan(&i.ID, &i.TriggerPayload, &i.IssueID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSchedulableAutopilotTriggers = `-- name: ListSchedulableAutopilotTriggers :many
 
 SELECT t.id, t.autopilot_id, t.cron_expression, t.timezone, t.created_at, t.last_fired_at

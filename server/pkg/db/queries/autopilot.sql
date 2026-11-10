@@ -420,6 +420,23 @@ WHERE autopilot_id = $1
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3;
 
+-- name: ListRecentAutopilotRunsForDedup :many
+-- Webhook runs of this autopilot that already created an issue inside the
+-- recent-duplicate window. The caller derives a subject from each
+-- trigger_payload (a GitLab object iid, a GitHub number) and collapses a later
+-- delivery of the same subject onto the earlier issue. The subject is not a
+-- column, so two events that share only a rendered title do not match here.
+-- A run with no issue is excluded: the in-flight run this dispatch just opened
+-- has not been linked yet, and must not count as its own duplicate.
+SELECT id, trigger_payload, issue_id
+FROM autopilot_run
+WHERE autopilot_id = sqlc.arg('autopilot_id')
+  AND source = 'webhook'
+  AND status IN ('issue_created', 'running', 'completed')
+  AND issue_id IS NOT NULL
+  AND created_at >= sqlc.arg('created_after')::timestamptz
+ORDER BY created_at ASC;
+
 -- name: UpdateAutopilotRunIssueCreated :one
 UPDATE autopilot_run
 SET status = 'issue_created', issue_id = $2
