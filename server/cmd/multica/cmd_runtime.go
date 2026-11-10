@@ -244,6 +244,15 @@ func runRuntimeDelete(cmd *cobra.Command, args []string) error {
 		})
 	}
 
+	// A 409 that did not fit in the body cap is a prefix, not a snapshot. Parsing
+	// it would either fail or — worse — yield only the agents that happened to fit,
+	// and confirming that partial set would unbind the wrong agents. Stop before
+	// either can happen, and say so without echoing the body: it carries agent
+	// instructions.
+	if runtimeDeleteConflictTruncated(err) {
+		return errors.New("delete runtime: the server's active-agent list is larger than this client can read, so the agent set to confirm is incomplete. Nothing was changed; retry after freeing agents from this runtime, or delete it from the app")
+	}
+
 	conflict, ok := runtimeDeleteConflict(err)
 	if !ok {
 		// Any other 409 is a deliberate, already-explained refusal — most often
@@ -252,6 +261,13 @@ func runRuntimeDelete(cmd *cobra.Command, args []string) error {
 		// past these, so there is nothing more for this command to try.
 		if _, msg, isConflict := serverConflictMessage(err); isConflict {
 			return errors.New(msg)
+		}
+		// A 409 that names the active-agent refusal but does not parse is the case
+		// the cascade path exists for, only without a usable snapshot. Wrapping the
+		// raw error would print the body, which is where agent instructions live, and
+		// there is no complete id set to confirm. Stop and say what to do instead.
+		if runtimeDeleteConflictUnreadable(err) {
+			return errors.New("delete runtime: the server reported active agents, but the response could not be read, so there is no complete agent set to confirm. Nothing was changed; retry, or delete the runtime from the app")
 		}
 		return fmt.Errorf("delete runtime: %w", err)
 	}
@@ -431,6 +447,12 @@ func serverConflictMessage(err error) (code string, message string, ok bool) {
 	if body == "" {
 		return "", "", false
 	}
+	// A body cut short by the read cap is a prefix, not a sentence. Passing it
+	// through would print agent instructions and whatever else the response
+	// happened to hold.
+	if httpErr.Truncated {
+		return "", "", false
+	}
 	var payload struct {
 		Code  string `json:"code"`
 		Error string `json:"error"`
@@ -438,8 +460,12 @@ func serverConflictMessage(err error) (code string, message string, ok bool) {
 	if json.Unmarshal([]byte(body), &payload) != nil {
 		// Not JSON. An older or proxied server can still put a readable
 		// sentence here, and swallowing it would be worse than passing it
-		// through — there is nothing to leak when the body was never
-		// structured in the first place.
+		// through. A body that merely starts like JSON is not that case: it is a
+		// payload we failed to read whole, and echoing it leaks whatever fields it
+		// held (agent instructions, on the runtime-delete refusal).
+		if strings.HasPrefix(body, "{") || strings.HasPrefix(body, "[") {
+			return "", "", false
+		}
 		return "", body, true
 	}
 	if strings.TrimSpace(payload.Error) == "" {
@@ -458,8 +484,8 @@ type runtimeDeleteConflictPayload struct {
 }
 
 func runtimeDeleteConflict(err error) (runtimeDeleteConflictPayload, bool) {
-	var httpErr *cli.HTTPError
-	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict {
+	httpErr, ok := runtimeDeleteHTTPError(err)
+	if !ok || httpErr.Truncated {
 		return runtimeDeleteConflictPayload{}, false
 	}
 	var payload runtimeDeleteConflictPayload
@@ -470,6 +496,40 @@ func runtimeDeleteConflict(err error) (runtimeDeleteConflictPayload, bool) {
 		return runtimeDeleteConflictPayload{}, false
 	}
 	return payload, true
+}
+
+// runtimeDeleteConflictTruncated reports a 409 whose body did not fit in the
+// client's cap. The kept prefix is not a snapshot: it must not be parsed, shown,
+// or confirmed.
+func runtimeDeleteConflictTruncated(err error) bool {
+	httpErr, ok := runtimeDeleteHTTPError(err)
+	return ok && httpErr.Truncated
+}
+
+// runtimeDeleteConflictUnreadable reports a 409 that claims the active-agent
+// refusal but does not decode into a snapshot. The body is withheld: a partial
+// or corrupt payload is exactly where agent instructions would leak, and there
+// is no complete id set to confirm from it.
+func runtimeDeleteConflictUnreadable(err error) bool {
+	httpErr, ok := runtimeDeleteHTTPError(err)
+	if !ok || httpErr.Truncated {
+		return false
+	}
+	var codeOnly struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(httpErr.Body), &codeOnly) != nil {
+		return strings.Contains(httpErr.Body, `"code":"runtime_has_active_agents"`)
+	}
+	return codeOnly.Code == "runtime_has_active_agents"
+}
+
+func runtimeDeleteHTTPError(err error) (*cli.HTTPError, bool) {
+	var httpErr *cli.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict {
+		return nil, false
+	}
+	return httpErr, true
 }
 
 func (p runtimeDeleteConflictPayload) AgentIDs() []string {

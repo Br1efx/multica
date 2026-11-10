@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -668,5 +669,81 @@ func TestHTTPErrorKeepsLargeStructuredBody(t *testing.T) {
 	}
 	if got.Code != "workflow_status_mapping_required" || len(got.Plan.Required) != 45 {
 		t.Fatalf("code = %q, required = %d; want the full plan", got.Code, len(got.Plan.Required))
+	}
+	if httpErr.Truncated {
+		t.Fatal("a body under the cap must not be reported as truncated")
+	}
+}
+
+// A runtime-delete 409 carries a full agent snapshot per active agent, including
+// instructions, and two of those at 40 KiB each blow past the old 64 KiB cap.
+// The body has to arrive whole: the caller parses it to learn which agents to
+// confirm, and a cut body neither parses nor yields a complete set (GH #10187).
+func TestHTTPErrorKeepsAgentSnapshotPastOldCap(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"code":  "runtime_has_active_agents",
+		"error": "cannot delete runtime: it has active agents bound to it.",
+		"active_agents": []map[string]any{
+			{"id": "agent-1", "instructions": strings.Repeat("a", 40<<10)},
+			{"id": "agent-2", "instructions": strings.Repeat("b", 40<<10)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	if len(payload) <= 64<<10 {
+		t.Fatalf("fixture is %d bytes; it must exceed the old 64 KiB cap", len(payload))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	err = NewAPIClient(srv.URL, "", "test-token").DeleteJSON(context.Background(), "/api/runtimes/rt-1")
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("err = %v, want *HTTPError", err)
+	}
+	if httpErr.Truncated {
+		t.Fatalf("body of %d bytes was truncated to %d", len(payload), len(httpErr.Body))
+	}
+	var got struct {
+		ActiveAgents []struct {
+			ID string `json:"id"`
+		} `json:"active_agents"`
+	}
+	if jerr := json.Unmarshal([]byte(httpErr.Body), &got); jerr != nil {
+		t.Fatalf("body of %d bytes did not parse (kept %d): %v", len(payload), len(httpErr.Body), jerr)
+	}
+	if len(got.ActiveAgents) != 2 || got.ActiveAgents[0].ID != "agent-1" || got.ActiveAgents[1].ID != "agent-2" {
+		t.Fatalf("active agents = %+v, want both ids", got.ActiveAgents)
+	}
+}
+
+// Past the cap the kept bytes are a prefix, and Truncated is the only signal a
+// caller has that parsing them would not yield the whole payload.
+func TestHTTPErrorMarksBodyPastCapTruncated(t *testing.T) {
+	const cap = maxErrorBodyBytes
+	body := append(bytes.Repeat([]byte("x"), cap), 'y')
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	err := NewAPIClient(srv.URL, "", "test-token").DeleteJSON(context.Background(), "/api/runtimes/rt-1")
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("err = %v, want *HTTPError", err)
+	}
+	if !httpErr.Truncated {
+		t.Fatal("a body past the cap must be reported as truncated")
+	}
+	if len(httpErr.Body) != cap {
+		t.Fatalf("kept %d bytes, want the cap %d", len(httpErr.Body), cap)
+	}
+	if strings.Contains(httpErr.Body, "y") {
+		t.Fatal("the byte past the cap was kept")
 	}
 }

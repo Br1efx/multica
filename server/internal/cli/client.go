@@ -81,6 +81,11 @@ type HTTPError struct {
 	Path       string
 	StatusCode int
 	Body       string
+	// Truncated is true when the error response was larger than the body cap,
+	// so Body is a prefix and must not be parsed as a complete payload. A
+	// caller that needs every field (for example the agent ids a cascade
+	// delete confirms) has to stop instead of acting on that prefix.
+	Truncated bool
 	// TaskScoped records that the failing request actually carried a
 	// task-scoped `mat_` token. It changes nothing about the request; it only
 	// lets FormatError tell a 401 worth signing in again for from one where
@@ -94,24 +99,45 @@ func (e *HTTPError) Error() string {
 
 // maxErrorBodyBytes caps how much of an error response is kept. It must hold
 // a whole structured error: a workflow's 409 status mapping plan lists one row
-// per status in use (up to 50) and runs past 4 KiB, and a truncated body no
-// longer parses as JSON. Only --debug prints the raw body.
-const maxErrorBodyBytes = 64 << 10
+// per status in use (up to 50) and runs past 4 KiB, and a runtime-delete 409
+// embeds a full agent snapshot (including instructions) per active agent, which
+// runs well past the old 64 KiB cap. A body cut at the cap no longer parses as
+// JSON, so a caller cannot tell a complete agent set from a prefix of one.
+// Only --debug prints the raw body.
+const maxErrorBodyBytes = 8 << 20
 
 // newHTTPError builds a *HTTPError from an error response (status >= 400),
-// reading a capped slice of the body. Every Multica API helper funnels its
+// reading the body up to maxErrorBodyBytes. Every Multica API helper funnels its
 // >= 400 responses through this so the top-level FormatError / ExitCodeFor can
 // classify the failure via errors.As(err, **HTTPError) regardless of which
-// HTTP verb the command used.
+// HTTP verb the command used. Truncated is set when the response continues
+// past the cap, so callers never treat the kept prefix as the whole payload.
 func newHTTPError(method, path string, resp *http.Response) *HTTPError {
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	data, truncated := readErrorBody(resp.Body)
 	return &HTTPError{
 		Method:     method,
 		Path:       path,
 		StatusCode: resp.StatusCode,
 		Body:       strings.TrimSpace(string(data)),
+		Truncated:  truncated,
 		TaskScoped: requestUsedTaskToken(resp),
 	}
+}
+
+// readErrorBody returns the response body and whether it exceeded the cap.
+// The extra byte is what distinguishes "exactly the cap" (complete) from
+// "larger than the cap" (a prefix). Whatever was not kept is discarded so the
+// connection can be reused.
+func readErrorBody(body io.Reader) ([]byte, bool) {
+	if body == nil {
+		return nil, false
+	}
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	if len(data) > maxErrorBodyBytes {
+		_, _ = io.Copy(io.Discard, body)
+		return data[:maxErrorBodyBytes], true
+	}
+	return data, false
 }
 
 // requestUsedTaskToken reports whether the request that produced resp actually

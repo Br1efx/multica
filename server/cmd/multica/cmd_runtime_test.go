@@ -139,12 +139,16 @@ func TestRunRuntimeDeleteCascadeConfirmsActiveAgentSnapshot(t *testing.T) {
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/runtimes/rt-1":
 			deleteCount++
 			w.WriteHeader(http.StatusConflict)
+			// The real 409 embeds a full agent snapshot per active agent, including
+			// instructions. Two of those at 40 KiB each push the body past the old
+			// 64 KiB cap; a truncated body neither parses nor yields a complete id set,
+			// so the command used to print the prefix and never confirm (GH #10187).
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"code":  "runtime_has_active_agents",
 				"error": "cannot delete runtime: it has active agents bound to it.",
 				"active_agents": []map[string]any{
-					{"id": "agent-1", "name": "Codex"},
-					{"id": "agent-2", "name": "Claude"},
+					{"id": "agent-1", "name": "Codex", "instructions": strings.Repeat("a", 40<<10)},
+					{"id": "agent-2", "name": "Claude", "instructions": strings.Repeat("b", 40<<10)},
 				},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/runtimes/rt-1/unbind-agents-and-delete":
@@ -190,6 +194,48 @@ func TestRunRuntimeDeleteCascadeConfirmsActiveAgentSnapshot(t *testing.T) {
 	}
 	if got["id"] != "rt-1" || got["deleted"] != true || got["agents_unbound"] != float64(2) {
 		t.Fatalf("stdout = %#v, want cascade result", got)
+	}
+}
+
+// A 409 that claims the active-agent refusal but does not parse is not a
+// snapshot. The command must stop without confirming, and without printing the
+// body: that is where agent instructions would leak.
+func TestRunRuntimeDeleteCascadeUnreadableConflictDoesNotConfirm(t *testing.T) {
+	redirectTestHome(t, t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	const instructions = "SECRET-AGENT-INSTRUCTIONS-do-not-print"
+	var cascadeCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/runtimes/rt-1":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"code":"runtime_has_active_agents","error":"cannot delete","active_agents":[{"id":"agent-1","instructions":"`+instructions+`"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/runtimes/rt-1/unbind-agents-and-delete":
+			cascadeCount++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cmd := newRuntimeDeleteTestCmd(srv.URL)
+	_ = cmd.Flags().Set("cascade", "true")
+
+	err := runRuntimeDelete(cmd, []string{"rt-1"})
+	if err == nil {
+		t.Fatal("expected the unreadable conflict to stop the command")
+	}
+	if cascadeCount != 0 {
+		t.Fatalf("cascadeCount = %d, want 0: an unreadable snapshot must not be confirmed", cascadeCount)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "could not be read") {
+		t.Fatalf("error = %q, want an actionable read failure", msg)
+	}
+	if strings.Contains(msg, instructions) || strings.Contains(msg, "active_agents") {
+		t.Fatalf("error leaked the response body: %q", msg)
 	}
 }
 
